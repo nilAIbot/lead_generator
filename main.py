@@ -735,3 +735,5 @@ if run:
 else:
     st.info("Set keywords/subreddits/feeds on the left, then click Run discovery. Results are limited to the past 30 days.")
 
+if __name__ == "__main__":
+    main()
