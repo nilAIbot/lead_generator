@@ -1,0 +1,5 @@
+streamlit
+requests
+tldextract
+beautifulsoup4
+python-dateutil
