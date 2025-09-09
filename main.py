@@ -1,55 +1,91 @@
-import re
+# app.py
 import os
+import re
 import time
-import json
 import math
 import html
-import requests
+import json
+import queue
+import random
+import string
+import hashlib
+import feedparser
+import phonenumbers
+import threading
 import tldextract
+import pandas as pd
 import streamlit as st
+import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dateutil import parser as dateparser
 
+APP_NAME = "Lead Radar Pro (Free Sources) — Outsourcing Clients & Developers"
+
 # ---------------------------
-# Config and constants
+# Config: sources & constants
 # ---------------------------
 
-APP_NAME = "Lead Radar: Clients & Developers (Last 30 Days)"
+MAX_DAYS = 30
+NOW = datetime.now(timezone.utc)
+EARLIEST_TS = NOW - timedelta(days=MAX_DAYS)
 
-DEFAULT_KEYWORDS = [
+DEFAULT_CLIENT_KEYWORDS = [
     "need app developer",
     "outsourcing software project",
     "mvp build",
     "looking for software agency",
     "hire developer for project",
-    "outsourcing",
-    "contract developer",
     "build our app",
     "build my app",
-    "web app developer",
-    "mobile app developer",
-    "full-stack developer",
-    "looking for dev shop",
-    "cto for hire",
-    "fixed bid",
-    "greenfield",
+    "contract developer",
     "prototype",
-    "poC",
+    "poc",
+    "fixed bid",
+    "seeking agency",
 ]
+
+DEFAULT_CANDIDATE_KEYWORDS = [
+    "for hire",
+    "open to work",
+    "available for freelance",
+    "available for contract",
+    "seeking projects",
+    "consultant available",
+]
+
+REDDIT_SUBS_DEFAULT = [
+    "forhire",              # [Hiring] (client) / [For Hire] (candidate)
+    "remotejobs",           # job posts (look for contract/agency-friendly)
+    "slavelabour",          # small budget tasks (sometimes MVPs)
+    "hiring",               # general hiring
+    "freelance",            # freelancers & requests
+    "EntrepreneurRideAlong",# solo founders seeking help
+    "startups",             # founders asking for help
+]
+
+RSS_FEEDS = [
+    # Funding signals (budget likely)
+    "https://techcrunch.com/tag/funding/feed/",
+    # Remote/contract dev jobs (potential outsource)
+    "https://remoteok.com/remote-dev+contract-jobs.rss",
+]
+
+REQUEST_HEADERS = {"User-Agent": "LeadRadarPro/1.0 (+https://example.com)"}
 
 CLIENT_HINTS = [
     "need developer",
     "looking for developer",
     "hiring contractor",
     "outsourcing",
+    "agency",
     "mvp",
     "prototype",
-    "build an app",
-    "agency",
-    "dev shop",
-    "help us build",
-    "[hiring]",   # r/forhire convention
+    "poc",
+    "[hiring]",
+    "contract",
+    "consultant needed",
 ]
 
 CANDIDATE_HINTS = [
@@ -57,44 +93,108 @@ CANDIDATE_HINTS = [
     "open to work",
     "available for freelance",
     "available for contract",
-    "[for hire]",  # r/forhire convention
+    "[for hire]",
+    "hire me",
+    "seeking projects",
 ]
 
 TRIGGER_KEYWORDS = {
     "funding": ["seed", "pre-seed", "series a", "series b", "venture funding", "raised", "funding", "round"],
     "launch": ["launched", "launching", "product hunt", "beta", "v1", "public launch", "go live"],
-    "hiring_freeze": ["hiring freeze", "budget freeze", "cost cutting", "contractors only"],
+    "hiring_freeze": ["hiring freeze", "budget freeze", "cost cutting", "contractors only", "backfill with contractors"],
     "scale_up": ["scale", "scaling", "increasing demand", "rapid growth", "high growth"],
-    "deadline": ["deadline", "urgent", "immediately", "asap", "deliver by"],
+    "deadline": ["deadline", "urgent", "immediately", "asap", "deliver by", "time sensitive"],
 }
 
-MAX_DAYS = 30
-NOW = datetime.now(timezone.utc)
-EARLIEST_TS = NOW - timedelta(days=MAX_DAYS)
+SKILL_LIB = [
+    "python","django","flask","fastapi","pandas",
+    "javascript","typescript","react","node","next.js","vue","angular","svelte",
+    "java","spring","kotlin","swift","objective-c",
+    "ios","android","react native","flutter",
+    "php","laravel","symfony","ruby","rails","go","rust","c#",".net","c++",
+    "aws","gcp","azure","devops","docker","kubernetes","terraform",
+    "postgres","mysql","mariadb","mongodb","redis","elasticsearch","graphql",
+    "ai","ml","llm","nlp","computer vision","pytorch","tensorflow",
+]
 
-REQUEST_HEADERS = {
-    "User-Agent": "LeadRadar/1.0 (+https://example.com)"
-}
+LOCK = threading.Lock()
 
-# Optional API keys (leave empty to skip)
-CLEARBIT_API_KEY = os.getenv("CLEARBIT_API_KEY", "")
-HUNTER_API_KEY = os.getenv("HUNTER_API_KEY", "")
+# Optional paid enrichment (disabled by default; leave keys blank)
+APOLLO_API_KEY = os.getenv("APOLLO_API_KEY", "")
+LUSHA_API_KEY = os.getenv("LUSHA_API_KEY", "")
 
 # ---------------------------
-# Utilities
+# Helpers
 # ---------------------------
 
-def safe_get(url, params=None, headers=None, timeout=20):
+def within_30_days(dt):
+    return dt and dt >= EARLIEST_TS
+
+def parse_any_dt(s):
+    if not s:
+        return None
     try:
-        r = requests.get(url, params=params, headers=headers or REQUEST_HEADERS, timeout=timeout)
-        r.raise_for_status()
-        return r
+        return dateparser.parse(s).astimezone(timezone.utc)
     except Exception:
         return None
 
-def extract_urls(text):
+def parse_unix_ts(ts):
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc)
+    except Exception:
+        return None
+
+def score_recency(dt):
+    if not dt:
+        return 0.0
+    days = (NOW - dt).total_seconds() / 86400
+    return max(0.0, min(1.0, 1.0 - (days / MAX_DAYS)))
+
+def score_trigger(text):
     if not text:
-        return []
+        return 0.0
+    t = text.lower()
+    score = 0.0
+    for bucket, kws in TRIGGER_KEYWORDS.items():
+        hits = sum(1 for k in kws if k in t)
+        if hits:
+            weight = {"funding": 1.0, "launch": 0.8, "hiring_freeze": 0.7, "scale_up": 0.6, "deadline": 0.5}.get(bucket, 0.4)
+            score += weight * min(hits, 3)
+    return min(1.0, score / 3.0)
+
+def score_engagement(points=None, comments=None):
+    p = (points or 0)
+    c = (comments or 0)
+    v = math.log1p(p + 0.6 * c)
+    return min(1.0, v / 5.0)
+
+def score_accessibility(has_email, has_phone):
+    base = 0.3 if has_email else 0.0
+    if has_phone:
+        base += 0.4
+    return min(1.0, base)
+
+def classify_post(title, text, subreddit=None):
+    s = " ".join([title or "", text or ""]).lower()
+    if subreddit and subreddit.lower() == "forhire":
+        if "[for hire]" in s:
+            return "Developer Candidate"
+        if "[hiring]" in s:
+            return "Potential Client"
+    client_hits = sum(1 for w in CLIENT_HINTS if w in s)
+    cand_hits = sum(1 for w in CANDIDATE_HINTS if w in s)
+    if cand_hits > client_hits and cand_hits > 0:
+        return "Developer Candidate"
+    if client_hits > 0:
+        return "Potential Client"
+    if "hire" in s and "developer" in s:
+        return "Potential Client"
+    if any(w in s for w in ["available", "for hire"]) and "developer" in s:
+        return "Developer Candidate"
+    return None
+
+def extract_urls(text):
+    if not text: return []
     regex = r"(https?://[^\s)]+)"
     return re.findall(regex, text)
 
@@ -108,233 +208,194 @@ def extract_domain(url):
     return None
 
 def html_to_text(s):
-    if not s:
-        return ""
+    if not s: return ""
     return BeautifulSoup(s, "html.parser").get_text(" ", strip=True)
 
-def within_30_days(dt):
-    if not dt:
-        return False
-    return dt >= EARLIEST_TS
-
-def parse_unix_ts(ts):
-    try:
-        return datetime.fromtimestamp(ts, tz=timezone.utc)
-    except Exception:
-        return None
-
-def parse_rfc3339(s):
-    try:
-        return dateparser.parse(s).astimezone(timezone.utc)
-    except Exception:
-        return None
-
-def score_recency(dt):
-    # 0..1: newer is better
-    if not dt:
-        return 0.0
-    days = (NOW - dt).days + (NOW - dt).seconds / 86400
-    return max(0.0, min(1.0, 1.0 - (days / MAX_DAYS)))
-
-def score_trigger(text):
-    if not text:
-        return 0.0
-    t = text.lower()
-    score = 0.0
-    for bucket, kws in TRIGGER_KEYWORDS.items():
-        hits = sum(1 for k in kws if k in t)
-        if hits:
-            # Weighted per bucket
-            weight = {
-                "funding": 1.0,
-                "launch": 0.8,
-                "hiring_freeze": 0.7,
-                "scale_up": 0.6,
-                "deadline": 0.5
-            }.get(bucket, 0.4)
-            score += weight * min(hits, 3)
-    # Normalize to ~0..1
-    return min(1.0, score / 3.0)
-
-def score_engagement(points=None, comments=None):
-    p = (points or 0)
-    c = (comments or 0)
-    # Log-scale
-    v = math.log1p(p + 0.5 * c)
-    return min(1.0, v / 5.0)
-
-def classify_post(title, text, subreddit_hint=None):
-    s = " ".join([title or "", text or ""]).lower()
-
-    # Subreddit strong signals:
-    if subreddit_hint:
-        sh = subreddit_hint.lower()
-        # r/forhire uses [Hiring] (client) and [For Hire] (candidate)
-        if sh == "forhire":
-            if "[for hire]" in s:
-                return "Developer Candidate"
-            if "[hiring]" in s:
-                return "Potential Client"
-
-    # Keyword rules
-    cand_hits = sum(1 for w in CANDIDATE_HINTS if w in s)
-    client_hits = sum(1 for w in CLIENT_HINTS if w in s)
-
-    if cand_hits > client_hits:
-        return "Developer Candidate"
-    if client_hits > 0:
-        return "Potential Client"
-
-    # Fallback heuristic
-    if "hire" in s and "developer" in s:
-        return "Potential Client"
-    if any(w in s for w in ["available", "for hire"]) and "developer" in s:
-        return "Developer Candidate"
-
-    return None
-
-def extract_company_info_from_text(text):
-    """
-    Heuristic: find first likely URL domain and derive a name-like string.
-    """
-    urls = extract_urls(text)
-    domain = None
-    website = None
-    for u in urls:
-        d = extract_domain(u)
-        if d and not any(x in d for x in ["reddit.com", "news.ycombinator.com", "github.com", "medium.com"]):
-            domain = d
-            website = f"https://{d}"
-            break
-    company_name = None
-    if domain:
-        base = domain.split(".")[0]
-        company_name = base.title()
-
-    return {
-        "company_name": company_name,
-        "website": website,
-        "domain": domain
-    }
-
-def guess_industry_from_text(text):
+def guess_industry(text):
     t = (text or "").lower()
     patterns = {
-        "Fintech": ["fintech", "payments", "ledger", "banking", "trading", "crypto", "defi"],
-        "Healthtech": ["health", "med", "clinic", "ehr", "wellness", "fitness"],
-        "E-commerce": ["shopify", "ecommerce", "storefront", "marketplace", "checkout"],
-        "SaaS": ["saas", "subscription", "b2b", "multi-tenant"],
-        "Edtech": ["education", "learning", "edtech", "course", "lms"],
-        "AI/ML": ["ai", "ml", "model", "llm", "computer vision", "nlp"],
-        "Logistics": ["logistics", "fleet", "delivery", "supply chain"],
-        "Real Estate": ["real estate", "property", "proptech"],
-        "Travel": ["travel", "booking", "itinerary"],
-        "Social": ["social", "community", "messaging"],
+        "Fintech": ["fintech","payments","banking","trading","ledger","crypto","defi"],
+        "Healthtech": ["health","med","clinic","ehr","wellness","fitness"],
+        "E-commerce": ["shopify","ecommerce","storefront","marketplace","checkout"],
+        "SaaS": ["saas","b2b","multi-tenant","subscription"],
+        "Edtech": ["education","learning","edtech","course","lms"],
+        "AI/ML": ["ai","ml","model","llm","computer vision","nlp"],
+        "Logistics": ["logistics","fleet","delivery","supply chain"],
+        "Real Estate": ["real estate","property","proptech"],
+        "Travel": ["travel","booking","itinerary"],
+        "Social": ["social","community","messaging","feed"],
     }
     for k, kws in patterns.items():
         if any(w in t for w in kws):
             return k
     return None
 
-def detect_trigger_event(text):
+def detect_trigger(text):
     t = (text or "").lower()
     hits = []
     for label, kws in TRIGGER_KEYWORDS.items():
         if any(k in t for k in kws):
-            hits.append(label.replace("_", " "))
+            hits.append(label.replace("_"," "))
+    order = ["funding","launch","hiring freeze","scale up","deadline"]
     if hits:
-        # Return first strongest
-        order = ["funding", "launch", "hiring freeze", "scale up", "deadline"]
         hits_sorted = sorted(hits, key=lambda x: order.index(x) if x in order else 99)
         return hits_sorted[0]
     return None
 
 def find_emails(text):
-    if not text:
-        return []
-    # Simple email pattern
+    if not text: return []
     pattern = r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
-    emails = set(re.findall(pattern, text))
-    return list(emails)[:3]
+    return list({e.lower() for e in re.findall(pattern, text)})[:5]
+
+def find_phones(text):
+    if not text: return []
+    # Use phonenumbers to parse; also catch tel: links
+    candidates = set()
+    for match in re.findall(r"(tel:\+?[0-9()\-\s]{7,20})", text, flags=re.I):
+        candidates.add(match.split(":",1)[1])
+    # Try parsing any digits-rich strings
+    for m in re.findall(r"(\+?[0-9][0-9()\-\s]{6,20}[0-9])", text):
+        try:
+            for country in ["US","IN","GB","CA","AU","SG","DE","NL","FR","ES","SE","NO","DK","IE","AE"]:
+                num = phonenumbers.parse(m, country)
+                if phonenumbers.is_possible_number(num) and phonenumbers.is_valid_number(num):
+                    candidates.add(phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.INTERNATIONAL))
+                    break
+        except Exception:
+            continue
+    return list(candidates)[:5]
+
+def company_from_urls(urls):
+    for u in urls or []:
+        d = extract_domain(u)
+        if d and not any(x in d for x in ["reddit.com","news.ycombinator.com","github.com","medium.com","twitter.com","linkedin.com","remoteok.com","techcrunch.com"]):
+            base = d.split(".")[0]
+            return base.title(), f"https://{d}", d
+    return None, None, None
+
+def fetch_url(url, timeout=15):
+    try:
+        r = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
+        if r.status_code == 200:
+            return r
+    except Exception:
+        pass
+    return None
+
+def safe_soup(url, timeout=15):
+    r = fetch_url(url, timeout=timeout)
+    if not r: return None
+    try:
+        return BeautifulSoup(r.text, "lxml")
+    except Exception:
+        return BeautifulSoup(r.text, "html.parser")
+
+def text_from_page(url):
+    soup = safe_soup(url)
+    if not soup: return ""
+    for t in soup(["script","style","noscript"]): t.extract()
+    return soup.get_text(" ", strip=True)
+
+def guess_contact_pages(base_url):
+    if not base_url: return []
+    return list(dict.fromkeys([
+        base_url,
+        base_url.rstrip("/") + "/contact",
+        base_url.rstrip("/") + "/contact-us",
+        base_url.rstrip("/") + "/about",
+        base_url.rstrip("/") + "/team",
+        base_url.rstrip("/") + "/careers",
+        base_url.rstrip("/") + "/company",
+    ]))
+
+def scrape_emails_phones_from_site(base_url):
+    found_emails, found_phones = set(), set()
+    for url in guess_contact_pages(base_url):
+        soup = safe_soup(url, timeout=12)
+        if not soup: continue
+        text = soup.get_text(" ", strip=True)
+        for a in soup.find_all("a", href=True):
+            if a["href"].startswith("mailto:"):
+                found_emails.add(a["href"].split(":",1)[1])
+            if a["href"].lower().startswith("tel:"):
+                found_phones.add(a["href"].split(":",1)[1])
+        found_emails.update(find_emails(text))
+        found_phones.update(find_phones(text))
+        if len(found_emails) >= 5 and len(found_phones) >= 5:
+            break
+    return list(found_emails)[:5], list(found_phones)[:5]
 
 def shorten(s, n=220):
-    if not s:
-        return ""
-    s = s.strip()
+    if not s: return ""
+    s = " ".join(s.split())
     return s if len(s) <= n else s[:n-1].rstrip() + "…"
 
+def dedupe_by_key(items, key_func):
+    seen, out = set(), []
+    for it in items:
+        k = key_func(it)
+        if k and k not in seen:
+            seen.add(k)
+            out.append(it)
+    return out
+
 # ---------------------------
-# Data sources fetchers
+# Free-source fetchers
 # ---------------------------
 
-def fetch_hn_algolia(keywords, days=30, max_hits=150):
-    """
-    Hacker News via Algolia API (public).
-    """
+def fetch_hn_algolia(keywords, max_pages=3):
     url = "https://hn.algolia.com/api/v1/search_by_date"
     query = " OR ".join(f"\"{k}\"" for k in keywords)
-    params = {
-        "query": query,
-        "tags": "story",
-        "numericFilters": f"created_at_i>{int(EARLIEST_TS.timestamp())}",
-        "hitsPerPage": 100,
-        "page": 0
-    }
-    results = []
-    for page in range(0, 3):
-        params["page"] = page
-        r = safe_get(url, params=params)
-        if not r:
+    out = []
+    for page in range(max_pages):
+        params = {
+            "query": query,
+            "tags": "story",
+            "numericFilters": f"created_at_i>{int(EARLIEST_TS.timestamp())}",
+            "hitsPerPage": 100,
+            "page": page
+        }
+        try:
+            r = requests.get(url, params=params, headers=REQUEST_HEADERS, timeout=20)
+            if r.status_code != 200: break
+            data = r.json()
+            for h in data.get("hits", []):
+                created = parse_any_dt(h.get("created_at"))
+                if not within_30_days(created): continue
+                out.append({
+                    "source": "Hacker News",
+                    "title": h.get("title") or "",
+                    "text": "",
+                    "url": h.get("url") or f"https://news.ycombinator.com/item?id={h.get('objectID')}",
+                    "author": h.get("author"),
+                    "created_at": created,
+                    "points": h.get("points") or 0,
+                    "comments": h.get("num_comments") or 0,
+                    "subreddit": None,
+                })
+            if not data.get("hits"): break
+            time.sleep(0.25)
+        except Exception:
             break
-        data = r.json()
-        hits = data.get("hits", [])
-        for h in hits:
-            title = h.get("title") or ""
-            url_ = h.get("url")
-            author = h.get("author")
-            created_at = parse_rfc3339(h.get("created_at"))
-            text = ""  # Stories often lack body; rely on title + URL
-            points = h.get("points") or 0
-            comments = h.get("num_comments") or 0
-            if not within_30_days(created_at):
-                continue
-            results.append({
-                "source": "Hacker News",
-                "title": title,
-                "text": text,
-                "url": url_ or f"https://news.ycombinator.com/item?id={h.get('objectID')}",
-                "author": author,
-                "created_at": created_at,
-                "points": points,
-                "comments": comments,
-                "subreddit": None
-            })
-            if len(results) >= max_hits:
-                break
-        if len(results) >= max_hits or len(hits) == 0:
-            break
-        time.sleep(0.3)
-    return results
+    return out
 
-def fetch_reddit_forhire(limit=120):
-    """
-    Reddit r/forhire new posts. Public JSON endpoint, no auth required.
-    """
-    url = f"https://www.reddit.com/r/forhire/new.json"
-    r = safe_get(url, params={"limit": str(limit)})
-    if not r:
+def fetch_reddit_subreddit(subreddit, limit=120):
+    url = f"https://www.reddit.com/r/{subreddit}/new.json"
+    try:
+        r = requests.get(url, params={"limit": str(limit)}, headers=REQUEST_HEADERS, timeout=20)
+        if r.status_code != 200: return []
+        data = r.json()
+    except Exception:
         return []
-    data = r.json()
     items = []
     for child in data.get("data", {}).get("children", []):
         d = child.get("data", {})
-        title = html.unescape(d.get("title", ""))
+        title = html.unescape(d.get("title", "")) or ""
         selftext = html.unescape(d.get("selftext", "")) or ""
         created = parse_unix_ts(d.get("created_utc"))
-        if not within_30_days(created):
-            continue
+        if not within_30_days(created): continue
         items.append({
-            "source": "Reddit",
+            "source": f"Reddit r/{subreddit}",
             "title": title,
             "text": selftext,
             "url": f"https://www.reddit.com{d.get('permalink', '')}",
@@ -342,250 +403,165 @@ def fetch_reddit_forhire(limit=120):
             "created_at": created,
             "points": d.get("score"),
             "comments": d.get("num_comments"),
-            "subreddit": "forhire"
+            "subreddit": subreddit
         })
     return items
 
-def fetch_reddit_subreddit(subreddit, keywords, limit=120):
-    """
-    Generic subreddit scan with keyword filter.
-    """
-    url = f"https://www.reddit.com/r/{subreddit}/new.json"
-    r = safe_get(url, params={"limit": str(limit)})
-    if not r:
-        return []
-    data = r.json()
-    items = []
-    kws = [k.lower() for k in keywords]
-    for child in data.get("data", {}).get("children", []):
-        d = child.get("data", {})
-        title = html.unescape(d.get("title", ""))
-        selftext = html.unescape(d.get("selftext", "")) or ""
-        created = parse_unix_ts(d.get("created_utc"))
-        if not within_30_days(created):
-            continue
-        blob = f"{title}\n{selftext}".lower()
-        if any(k in blob for k in kws):
-            items.append({
-                "source": "Reddit",
+def fetch_rss(url):
+    try:
+        feed = feedparser.parse(url)
+        out = []
+        for e in feed.entries:
+            dt = parse_any_dt(getattr(e, "published", None) or getattr(e, "updated", None))
+            if not within_30_days(dt): continue
+            title = html_to_text(getattr(e, "title", "") or "")
+            summary = html_to_text(getattr(e, "summary", "") or "")
+            link = getattr(e, "link", "")
+            out.append({
+                "source": f"RSS {extract_domain(url) or 'feed'}",
                 "title": title,
-                "text": selftext,
-                "url": f"https://www.reddit.com{d.get('permalink', '')}",
-                "author": d.get("author"),
-                "created_at": created,
-                "points": d.get("score"),
-                "comments": d.get("num_comments"),
-                "subreddit": subreddit
+                "text": summary,
+                "url": link,
+                "author": getattr(e, "author", None),
+                "created_at": dt,
+                "points": None,
+                "comments": None,
+                "subreddit": None
             })
-    return items
-
-# ---------------------------
-# Enrichment
-# ---------------------------
-
-def simple_company_enrichment(website):
-    if not website:
-        return {}
-    resp = safe_get(website, timeout=10)
-    info = {}
-    if resp and resp.text:
-        soup = BeautifulSoup(resp.text, "html.parser")
-        title = soup.title.get_text(strip=True) if soup.title else None
-        desc = None
-        md = soup.find("meta", attrs={"name": "description"})
-        if md and md.get("content"):
-            desc = md["content"].strip()
-        info["site_title"] = title
-        info["site_desc"] = desc
-    return info
-
-def optional_clearbit_company(domain):
-    if not CLEARBIT_API_KEY or not domain:
-        return {}
-    try:
-        r = requests.get(
-            f"https://company.clearbit.com/v2/companies/find",
-            params={"domain": domain},
-            auth=(CLEARBIT_API_KEY, ""),
-            timeout=15,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            return {
-                "company_name": data.get("name"),
-                "website": data.get("domain") and f"https://{data.get('domain')}",
-                "industry": data.get("category", {}).get("industry"),
-                "size": data.get("metrics", {}).get("employeesRange"),
-                "location": data.get("location"),
-                "linkedin": data.get("site", {}).get("linkedin"),
-            }
+        return out
     except Exception:
-        pass
-    return {}
-
-def optional_hunter_email(domain):
-    if not HUNTER_API_KEY or not domain:
         return []
-    try:
-        r = requests.get(
-            "https://api.hunter.io/v2/domain-search",
-            params={"domain": domain, "api_key": HUNTER_API_KEY, "limit": 5},
-            timeout=15,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            emails = data.get("data", {}).get("emails", [])
-            out = []
-            for e in emails[:3]:
-                out.append({
-                    "value": e.get("value"),
-                    "first_name": e.get("first_name"),
-                    "last_name": e.get("last_name"),
-                    "position": e.get("position"),
-                    "linkedin": e.get("linkedin")
-                })
-            return out
-    except Exception:
-        pass
-    return []
 
 # ---------------------------
-# Pipeline
+# Build pipeline
 # ---------------------------
 
-def build_leads(keywords, extra_subreddits, max_items=100):
-    # 1) Fetch
-    hn_items = fetch_hn_algolia(keywords, max_hits=max_items)
-    forhire_items = fetch_reddit_forhire(limit=120)
-    other_reddits = []
-    for sub in extra_subreddits:
-        other_reddits.extend(fetch_reddit_subreddit(sub, keywords, limit=120))
+def build_from_sources(client_kws, candidate_kws, subreddits, rss_feeds, max_workers=12):
+    all_items = []
 
-    items = hn_items + forhire_items + other_reddits
+    # Parallel fetch
+    tasks = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        tasks.append(ex.submit(fetch_hn_algolia, client_kws + candidate_kws, 3))
+        for sub in set(subreddits or []):
+            tasks.append(ex.submit(fetch_reddit_subreddit, sub, 120))
+        for rss in set(rss_feeds or []):
+            tasks.append(ex.submit(fetch_rss, rss))
 
-    # 2) Classify and transform
-    potential_clients = []
-    developer_candidates = []
+        for fut in as_completed(tasks):
+            try:
+                all_items.extend(fut.result() or [])
+            except Exception:
+                continue
 
-    for it in items:
-        title = it["title"] or ""
-        text = it["text"] or ""
-        sub = it.get("subreddit")
-        classification = classify_post(title, text, subreddit_hint=sub)
-        if not classification:
-            continue
+    # Classify
+    potential_clients, developer_candidates = [], []
+    for it in all_items:
+        c = classify_post(it["title"], it["text"], subreddit=it.get("subreddit"))
+        if not c:
+            # Keyword filter pass
+            blob = f"{it['title']} {it['text']}".lower()
+            if any(k.lower() in blob for k in client_kws):
+                c = "Potential Client"
+            elif any(k.lower() in blob for k in candidate_kws):
+                c = "Developer Candidate"
+            else:
+                continue
+        # Extracts
+        urls = extract_urls(f"{it['title']} {it['text']} {it.get('url','')}")
+        comp_name, comp_site, comp_domain = company_from_urls(urls)
+        emails_inline = find_emails(it["text"])
+        phones_inline = find_phones(it["text"])
+        trigger = detect_trigger(f"{it['title']} {it['text']}")
+        industry = guess_industry(f"{it['title']} {it['text']}")
+        # Score
+        rec_score = score_recency(it["created_at"])
+        trig_score = score_trigger(f"{it['title']} {it['text']}")
+        eng_score = score_engagement(it.get("points"), it.get("comments"))
+        access_score = score_accessibility(bool(emails_inline), bool(phones_inline))
+        score = round(0.38*trig_score + 0.30*rec_score + 0.18*eng_score + 0.14*access_score, 4)
 
-        created_at = it["created_at"]
-        if not within_30_days(created_at):
-            continue
-
-        trigger = detect_trigger_event(f"{title}\n{text}")
-        urls = extract_urls(f"{title}\n{text}\n{it.get('url','')}")
-        domain_guess = extract_company_info_from_text(f"{title}\n{text}\n{it.get('url','')}")
-        industry_guess = guess_industry_from_text(f"{title}\n{text}")
-        emails_inline = find_emails(text)
-
-        # Ranking score
-        score = (
-            0.45 * score_trigger(f"{title}\n{text}") +
-            0.35 * score_recency(created_at) +
-            0.20 * score_engagement(it.get("points"), it.get("comments"))
-        )
-
-        doc = {
-            "title": title,
-            "text": text,
-            "source": it["source"],
-            "url": it["url"],
-            "author": it.get("author"),
-            "created_at": created_at,
-            "points": it.get("points"),
-            "comments": it.get("comments"),
-            "subreddit": sub,
+        record = {
+            **it,
             "urls": urls,
-            "domain_guess": domain_guess,
-            "industry_guess": industry_guess,
+            "company_name_guess": comp_name,
+            "company_website_guess": comp_site,
+            "company_domain_guess": comp_domain,
             "emails_inline": emails_inline,
+            "phones_inline": phones_inline,
             "trigger": trigger,
-            "score": round(score, 4),
+            "industry_guess": industry,
+            "score": score
         }
 
-        if classification == "Potential Client":
-            potential_clients.append(doc)
-        elif classification == "Developer Candidate":
-            developer_candidates.append(doc)
+        if c == "Potential Client":
+            potential_clients.append(record)
+        else:
+            developer_candidates.append(record)
 
-    # 3) Enrich clients (lightweight + optional)
-    for doc in potential_clients:
-        website = doc["domain_guess"].get("website")
-        domain = doc["domain_guess"].get("domain")
+    # Enrich clients: scrape site contact info (free)
+    def enrich_client(doc):
+        site = doc.get("company_website_guess")
+        emails, phones = [], []
+        site_title, site_desc = None, None
+        if site:
+            soup = safe_soup(site)
+            if soup:
+                site_title = soup.title.get_text(strip=True) if soup.title else None
+                meta = soup.find("meta", attrs={"name": "description"})
+                site_desc = meta["content"].strip() if meta and meta.get("content") else None
+            e2, p2 = scrape_emails_phones_from_site(site)
+            emails = list(dict.fromkeys(doc["emails_inline"] + e2))[:5]
+            phones = list(dict.fromkeys(doc["phones_inline"] + p2))[:5]
+        else:
+            emails, phones = doc["emails_inline"], doc["phones_inline"]
 
-        # Lightweight site scrape
-        site_info = simple_company_enrichment(website) if website else {}
-        doc["site_title"] = site_info.get("site_title")
-        doc["site_desc"] = site_info.get("site_desc")
+        # Update access score with site finds
+        access_score = score_accessibility(bool(emails), bool(phones))
+        rec_score = score_recency(doc["created_at"])
+        trig_score = score_trigger(f"{doc['title']} {doc['text']}")
+        eng_score = score_engagement(doc.get("points"), doc.get("comments"))
+        new_score = round(0.36*trig_score + 0.28*rec_score + 0.16*eng_score + 0.20*access_score, 4)
 
-        # Optional Clearbit enrichment
-        cb = optional_clearbit_company(domain)
-        # Keep guessed if enrichment missing fields
-        doc["company_name"] = cb.get("company_name") or doc["domain_guess"].get("company_name")
-        doc["company_website"] = cb.get("website") or website
-        doc["industry"] = cb.get("industry") or doc.get("industry_guess")
-        doc["size"] = cb.get("size")
-        doc["location"] = cb.get("location")
-        doc["linkedin_company"] = cb.get("linkedin")
+        doc.update({
+            "site_title": site_title,
+            "site_desc": site_desc,
+            "emails": emails,
+            "phones": phones,
+            "score": new_score
+        })
+        return doc
 
-        # Decision-makers (very light heuristic from text + optional Hunter)
-        decision_emails = optional_hunter_email(domain)
-        contacts = []
-        if decision_emails:
-            for e in decision_emails:
-                contacts.append({
-                    "name": " ".join([e.get("first_name") or "", e.get("last_name") or ""]).strip() or None,
-                    "role": e.get("position"),
-                    "email": e.get("value"),
-                    "linkedin": e.get("linkedin")
-                })
-        # Also include inline emails if present
-        for e in doc.get("emails_inline", []):
-            contacts.append({"name": None, "role": None, "email": e, "linkedin": None})
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        potential_clients = list(ex.map(enrich_client, potential_clients))
 
-        doc["decision_makers"] = contacts[:3]
+    # Enrich candidates: skills, availability, YoE, location
+    for d in developer_candidates:
+        t = (d["title"] + " " + d["text"]).lower()
+        skills = sorted({s for s in SKILL_LIB if s in t})
+        avail = "Immediate" if any(k in t for k in ["immediate","asap","available now"]) else "Notice Period"
+        m_yoe = re.search(r"(\d{1,2})\+?\s*(?:years|yrs|y)", t)
+        yoe = int(m_yoe.group(1)) if m_yoe else None
+        m_loc = re.search(r"(remote|india|usa|europe|uk|canada|australia|singapore|germany|netherlands|uae|dubai)", t)
+        loc = m_loc.group(1).title() if m_loc else "Remote/Unspecified"
+        # Try portfolios
+        urls = d.get("urls", [])
+        portfolios = [u for u in urls if any(x in u for x in ["github.com","gitlab.com","behance.net","dribbble.com","codepen.io","linkedin.com","portfolio","notion.site"])]
+        d.update({
+            "skills": skills[:15],
+            "availability": avail,
+            "yoe": yoe,
+            "location_guess": loc,
+            "portfolios": portfolios[:5]
+        })
 
-    # 4) Minimal enrichment for candidates
-    for doc in developer_candidates:
-        # Extract portfolios if present
-        portfolios = [u for u in doc.get("urls", []) if any(x in u for x in ["github.com", "gitlab.com", "behance.net", "dribbble.com", "codepen.io", "linkedin.com", "personal."])]
-        doc["portfolios"] = portfolios[:5]
-        # Skills heuristic
-        skills = []
-        t = (doc["title"] + " " + doc["text"]).lower()
-        skill_lib = ["python", "django", "flask", "fastapi", "javascript", "typescript", "react", "node", "next.js", "vue", "angular",
-                     "java", "spring", "kotlin", "swift", "ios", "android", "react native", "flutter",
-                     "aws", "gcp", "azure", "devops", "docker", "kubernetes",
-                     "postgres", "mysql", "mongodb", "redis", "graphql",
-                     "ai", "ml", "llm", "nlp", "computer vision"]
-        for s in skill_lib:
-            if s in t:
-                skills.append(s)
-        doc["skills_extracted"] = sorted(list(set(skills)))[:15]
+    # Dedupe by company domain for clients and by author+title for candidates
+    potential_clients = dedupe_by_key(potential_clients, lambda x: x.get("company_domain_guess") or extract_domain(x.get("url") or "") or x.get("url"))
+    developer_candidates = dedupe_by_key(developer_candidates, lambda x: (x.get("author"), x.get("title")))
 
-        # Availability heuristic
-        avail = "Immediate" if any(k in t for k in ["immediate", "asap", "available now"]) else "Notice Period"
-        doc["availability"] = avail
-
-        # Years of experience heuristic
-        m = re.search(r"(\d{1,2})\+?\s*(?:years|yrs|y)", t)
-        yoe = int(m.group(1)) if m else None
-        doc["yoe"] = yoe
-
-        # Location heuristic
-        m2 = re.search(r"(remote|india|usa|europe|uk|canada|australia|singapore|germany|netherlands)", t)
-        doc["location_guess"] = m2.group(1).title() if m2 else None
-
-    # 5) Rank
-    potential_clients = sorted(potential_clients, key=lambda x: x["score"], reverse=True)
-    developer_candidates = sorted(developer_candidates, key=lambda x: x["score"], reverse=True)
+    # Rank
+    potential_clients.sort(key=lambda x: x["score"], reverse=True)
+    developer_candidates.sort(key=lambda x: x["score"], reverse=True)
 
     return potential_clients, developer_candidates
 
@@ -593,147 +569,169 @@ def build_leads(keywords, extra_subreddits, max_items=100):
 # Rendering
 # ---------------------------
 
-def render_output(clients, candidates, top_n_clients=20, top_n_candidates=20):
-    out = []
-
-    out.append("## Potential Clients")
+def render_markdown(clients, candidates, top_n_clients=30, top_n_candidates=30):
+    lines = []
+    lines.append("## Potential Clients")
     if not clients:
-        out.append("- No results found in the last 30 days.")
+        lines.append("- No results found in the last 30 days.")
     else:
-        for doc in clients[:top_n_clients]:
-            cname = doc.get("company_name") or doc["domain_guess"].get("company_name") or "(Company TBD)"
-            website = doc.get("company_website") or doc["domain_guess"].get("website") or doc["url"]
-            industry = doc.get("industry") or "Unknown"
-            size = doc.get("size") or "Unknown"
-            location = doc.get("location") or "Unknown"
-
-            # Opportunity summary
-            snippet = shorten(doc.get("text") or doc.get("site_desc") or doc.get("title"), 280)
-            opp = f"{snippet} (Source: {doc['source']})"
-
-            # Contact
-            if doc.get("decision_makers"):
-                c = doc["decision_makers"][0]
-                contact_line = f"{(c.get('name') or 'Contact TBD')}, {(c.get('role') or 'Decision-maker')}, {c.get('email') or c.get('linkedin') or website}"
-            else:
-                # Fallback to author or website
-                contact_line = f"{(doc.get('author') or 'Contact TBD')}, Point of contact, {website}"
-
-            # Trigger
-            trig = doc.get("trigger") or "Not specified"
-
-            # Markdown block
-            out.append(f"- **{cname}:** {website} | {industry} | {size} | {location}")
-            out.append(f"  - **{cname} – Opportunity Summary:** {opp}")
-            out.append(f"  - **Contact:** {contact_line}")
-            out.append(f"  - **Trigger Event:** {trig}")
-            out.append(f"  - **Post:** {doc['title']} | {doc['url']}")
-            out.append("")
-
-    out.append("## Developer Candidates")
+        for c in clients[:top_n_clients]:
+            cname = c.get("company_name_guess") or "(Company TBD)"
+            website = c.get("company_website_guess") or c.get("url")
+            industry = c.get("industry_guess") or "Unknown"
+            location = "Unknown"
+            snippet = shorten(c.get("text") or c.get("site_desc") or c.get("title"), 280)
+            contact_bits = []
+            if c.get("emails"):
+                contact_bits.append(c["emails"][0])
+            if c.get("phones"):
+                contact_bits.append(c["phones"][0])
+            contact_line = " | ".join(contact_bits) if contact_bits else website
+            trig = c.get("trigger") or "Not specified"
+            lines.append(f"- **{cname}:** {website} | {industry} | Score {c['score']}")
+            lines.append(f"  - **{cname} – Opportunity Summary:** {snippet} (Source: {c['source']})")
+            lines.append(f"  - **Contact:** {contact_line}")
+            lines.append(f"  - **Trigger Event:** {trig}")
+            lines.append(f"  - **Post:** {c['title']} | {c['url']}")
+            lines.append("")
+    lines.append("## Developer Candidates")
     if not candidates:
-        out.append("- No results found in the last 30 days.")
+        lines.append("- No results found in the last 30 days.")
     else:
-        for doc in candidates[:top_n_candidates]:
-            name = (doc.get("author") or "Developer") + " (Reddit/HN)"
-            skills = ", ".join(doc.get("skills_extracted", [])[:10]) or "Skills not specified"
-            portfolios = doc.get("portfolios") or [doc.get("url")]
-            portfolios_str = " | ".join(portfolios[:3])
-            availability = doc.get("availability") or "Notice Period"
-            yoe = f"{doc.get('yoe')} years" if doc.get("yoe") else "N/A"
-            loc = doc.get("location_guess") or "Remote/Unspecified"
+        for d in candidates[:top_n_candidates]:
+            name = (d.get("author") or "Developer") + " (" + (d.get("source") or "") + ")"
+            skills = ", ".join(d.get("skills", [])[:10]) or "Skills not specified"
+            portfolios = d.get("portfolios") or [d.get("url")]
+            availability = d.get("availability") or "Notice Period"
+            yoe = f"{d.get('yoe')} years" if d.get("yoe") else "N/A"
+            loc = d.get("location_guess") or "Remote/Unspecified"
+            lines.append(f"- **{name} – Skills Summary:** {skills}")
+            lines.append(f"  - **Portfolio:** " + " | ".join(portfolios[:3]))
+            lines.append(f"  - **Availability:** {availability} | **Experience:** {yoe} | **Location:** {loc}")
+            lines.append(f"  - **Post:** {d['title']} | {d['url']}")
+            lines.append("")
+    return "\n".join(lines)
 
-            # Summary line
-            out.append(f"- **{name} – Skills Summary:** {skills}")
-            out.append(f"  - **Portfolio:** {portfolios_str}")
-            out.append(f"  - **Availability:** {availability} | **Experience:** {yoe} | **Location:** {loc}")
-            out.append(f"  - **Post:** {doc['title']} | {doc['url']}")
-            out.append("")
+def to_clients_df(clients):
+    rows = []
+    for c in clients:
+        rows.append({
+            "Company": c.get("company_name_guess"),
+            "Website": c.get("company_website_guess") or c.get("url"),
+            "Industry": c.get("industry_guess"),
+            "Trigger": c.get("trigger"),
+            "Emails": ", ".join(c.get("emails", [])),
+            "Phones": ", ".join(c.get("phones", [])),
+            "Score": c.get("score"),
+            "Source": c.get("source"),
+            "Post Title": c.get("title"),
+            "Post URL": c.get("url"),
+            "Created": c.get("created_at").isoformat() if c.get("created_at") else None,
+        })
+    return pd.DataFrame(rows)
 
-    return "\n".join(out)
+def to_candidates_df(cands):
+    rows = []
+    for d in cands:
+        rows.append({
+            "Handle": d.get("author"),
+            "Skills": ", ".join(d.get("skills", [])),
+            "Availability": d.get("availability"),
+            "YoE": d.get("yoe"),
+            "Location": d.get("location_guess"),
+            "Portfolios": ", ".join(d.get("portfolios", [])),
+            "Score": d.get("score"),
+            "Source": d.get("source"),
+            "Post Title": d.get("title"),
+            "Post URL": d.get("url"),
+            "Created": d.get("created_at").isoformat() if d.get("created_at") else None,
+        })
+    return pd.DataFrame(rows)
 
 # ---------------------------
 # Streamlit UI
 # ---------------------------
 
-def main():
-    st.set_page_config(page_title=APP_NAME, page_icon="🔎", layout="wide")
-    st.title(APP_NAME)
-    st.caption("Find outsourcing-ready clients and available developers from the last 30 days. Ranked by potential value.")
+st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
+st.title(APP_NAME)
+st.caption("Free-source lead discovery with phones + emails. Last 30 days. Ranked for maximum sales leverage.")
 
-    with st.sidebar:
-        st.header("Input")
-        kw = st.text_area(
-            "Keywords",
-            value=", ".join(DEFAULT_KEYWORDS),
-            help="Comma-separated phrases to search for."
-        )
-        extra_subs = st.text_input(
-            "Extra subreddits",
-            value="startups, entrepreneur, freelance, forhire",
-            help="Comma-separated subreddit names (we always scan r/forhire)."
-        )
-        max_items = st.slider("Max HN items", min_value=50, max_value=300, value=150, step=50)
-        top_clients = st.slider("Top clients to show", min_value=5, max_value=50, value=20, step=5)
-        top_cands = st.slider("Top candidates to show", min_value=5, max_value=50, value=20, step=5)
-        st.markdown("---")
-        st.subheader("Optional enrichment keys")
-        st.text_input("CLEARBIT_API_KEY", value=os.getenv("CLEARBIT_API_KEY", ""), type="password", key="cb_key")
-        st.text_input("HUNTER_API_KEY", value=os.getenv("HUNTER_API_KEY", ""), type="password", key="hunter_key")
-        st.caption("If provided, company and contact enrichment improves. Leave blank to skip.")
+with st.sidebar:
+    st.header("Discovery inputs")
+    client_kw = st.text_area("Client intent keywords (comma-separated)", value=", ".join(DEFAULT_CLIENT_KEYWORDS))
+    cand_kw = st.text_area("Candidate intent keywords (comma-separated)", value=", ".join(DEFAULT_CANDIDATE_KEYWORDS))
+    subs_default = ", ".join(REDDIT_SUBS_DEFAULT)
+    subreddits = st.text_input("Reddit subreddits (comma-separated)", value=subs_default)
+    rss_default = ", ".join(RSS_FEEDS)
+    rss_feeds_str = st.text_input("RSS feeds (comma-separated)", value=rss_default)
+    st.markdown("---")
+    st.header("Filters")
+    min_score = st.slider("Minimum lead score", 0, 100, 50, step=5)
+    industry_filter = st.multiselect("Industries", ["Fintech","Healthtech","E-commerce","SaaS","Edtech","AI/ML","Logistics","Real Estate","Travel","Social"])
+    require_contact = st.checkbox("Require email or phone", value=False)
+    st.markdown("---")
+    st.header("Optional enrichment (paid; leave blank to skip)")
+    APOLLO_API_KEY = st.text_input("APOLLO_API_KEY", value=os.getenv("APOLLO_API_KEY",""), type="password")
+    LUSHA_API_KEY = st.text_input("LUSHA_API_KEY", value=os.getenv("LUSHA_API_KEY",""), type="password")
+    st.markdown("---")
+    run = st.button("Run discovery")
 
-        run = st.button("Run discovery")
+if run:
+    with st.spinner("Harvesting sources, extracting phones/emails, and ranking leads..."):
+        client_kws = [x.strip() for x in client_kw.split(",") if x.strip()]
+        cand_kws = [x.strip() for x in cand_kw.split(",") if x.strip()]
+        subs = [x.strip() for x in subreddits.split(",") if x.strip()]
+        rss_list = [x.strip() for x in rss_feeds_str.split(",") if x.strip()]
+        clients, candidates = build_from_sources(client_kws, cand_kws, subs, rss_list)
 
-    if run:
-        keywords = [x.strip() for x in kw.split(",") if x.strip()]
-        extra_subreddits = [x.strip() for x in extra_subs.split(",") if x.strip()]
-        # Set env keys for this run
-        global CLEARBIT_API_KEY, HUNTER_API_KEY
-        CLEARBIT_API_KEY = st.session_state.get("cb_key") or ""
-        HUNTER_API_KEY = st.session_state.get("hunter_key") or ""
+        # Apply filters
+        def pass_filters_client(c):
+            if c["score"]*100 < min_score: return False
+            if industry_filter and (c.get("industry_guess") not in industry_filter): return False
+            if require_contact and not ((c.get("emails") and len(c["emails"])>0) or (c.get("phones") and len(c["phones"])>0)):
+                return False
+            return True
 
-        with st.spinner("Searching sources and building ranked lead lists..."):
-            clients, candidates = build_leads(keywords, extra_subreddits, max_items=max_items)
-            md = render_output(clients, candidates, top_n_clients=top_clients, top_n_candidates=top_cands)
+        clients_f = [c for c in clients if pass_filters_client(c)]
+        candidates_f = [d for d in candidates if d["score"]*100 >= min_score]
 
-        st.success(f"Found {len(clients)} potential clients and {len(candidates)} developer candidates (last 30 days).")
-        st.download_button("Download markdown", data=md.encode("utf-8"), file_name="lead_radar.md", mime="text/markdown")
-        st.markdown(md)
+        md = render_markdown(clients_f, candidates_f, top_n_clients=50, top_n_candidates=50)
 
-        # Also show raw tables for quick scanning
-        with st.expander("Raw client data"):
-            st.dataframe([
-                {
-                    "Company": c.get("company_name") or c["domain_guess"].get("company_name"),
-                    "Website": c.get("company_website") or c["domain_guess"].get("website"),
-                    "Industry": c.get("industry"),
-                    "Trigger": c.get("trigger"),
-                    "Score": c.get("score"),
-                    "Source": c.get("source"),
-                    "Post": c.get("title"),
-                    "URL": c.get("url"),
-                    "Created": c.get("created_at"),
-                } for c in clients
-            ], use_container_width=True)
+    st.success(f"Found {len(clients_f)} potential clients and {len(candidates_f)} developer candidates (filtered).")
 
-        with st.expander("Raw candidate data"):
-            st.dataframe([
-                {
-                    "Author": d.get("author"),
-                    "Skills": ", ".join(d.get("skills_extracted", [])),
-                    "Availability": d.get("availability"),
-                    "YoE": d.get("yoe"),
-                    "Location": d.get("location_guess"),
-                    "Score": d.get("score"),
-                    "Source": d.get("source"),
-                    "Post": d.get("title"),
-                    "URL": d.get("url"),
-                    "Created": d.get("created_at"),
-                } for d in candidates
-            ], use_container_width=True)
+    # Downloads
+    st.download_button("Download markdown", data=md.encode("utf-8"), file_name="lead_radar_pro.md", mime="text/markdown")
 
-    else:
-        st.info("Set your keywords and subreddits, then click Run discovery. Results are limited to the past 30 days.")
+    cdf = to_clients_df(clients_f)
+    ddf = to_candidates_df(candidates_f)
+    st.download_button("Download clients (CSV)", data=cdf.to_csv(index=False).encode("utf-8"), file_name="clients.csv", mime="text/csv")
+    st.download_button("Download candidates (CSV)", data=ddf.to_csv(index=False).encode("utf-8"), file_name="candidates.csv", mime="text/csv")
 
-if __name__ == "__main__":
-    main()
+    # Display
+    st.markdown(md)
+
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Clients table")
+        st.dataframe(cdf, use_container_width=True)
+    with col2:
+        st.subheader("Candidates table")
+        st.dataframe(ddf, use_container_width=True)
+
+    # Call-ready view
+    with st.expander("Call-ready sheets (top 20)"):
+        for c in clients_f[:20]:
+            cname = c.get("company_name_guess") or "Company"
+            website = c.get("company_website_guess") or c.get("url")
+            phones = " | ".join(c.get("phones", [])[:2]) or "Phone: N/A"
+            emails = " | ".join(c.get("emails", [])[:2]) or "Email: N/A"
+            st.markdown(f"**{cname}** — {website}  \n"
+                        f"Trigger: {c.get('trigger') or 'None'} | Industry: {c.get('industry_guess') or 'Unknown'} | Score: {int(c['score']*100)}  \n"
+                        f"{phones}  \n"
+                        f"{emails}  \n"
+                        f"Post: {c['title']}  \n"
+                        f"Link: {c['url']}")
+else:
+    st.info("Set keywords/subreddits/feeds on the left, then click Run discovery. Results are limited to the past 30 days.")
+
